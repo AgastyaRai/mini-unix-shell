@@ -19,6 +19,39 @@ It runs external programs with `fork`/`execvp`, background jobs with `&`, and ha
 
 #### General Usage
 
+```
+crash> sleep 30 &
+[1] (19887)  running  sleep
+crash> jobs 
+[1] (19887)  running  sleep
+crash> sleep 20 &
+[2] (20002)  running  sleep
+crash> jobs
+[1] (19887)  running  sleep
+[2] (20002)  running  sleep
+crash> sleep 30
+^Z[3] (20055)  suspended  sleep
+crash> jobs
+[1] (19887)  running  sleep
+[2] (20002)  running  sleep
+[3] (20055)  suspended  sleep
+crash> bg %3
+crash> [3] (20055)  continued  sleep
+jobs
+[1] (19887)  running  sleep
+[2] (20002)  running  sleep
+[3] (20055)  running  sleep
+crash> fg %1
+^C[1] (19887)  killed  sleep
+crash> jobs
+[2] (20002)  running  sleep
+[3] (20055)  running  sleep
+crash> [2] (20002)  finished  sleep
+nuke %3
+[3] (20055)  killed  sleep
+crash> jobs
+crash> quit
+```
 
 
 
