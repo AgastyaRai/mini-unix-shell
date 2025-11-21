@@ -14,8 +14,34 @@ make
 It runs external programs with `fork`/`execvp`, background jobs with `&`, and has built-in support for `jobs`, `fg`, `bg`, `nuke` and `quit`, along with signal handling.
 
 
+### Shell Scripts
+
+This repo also contains simple shell scripts that test and demonstrate the job control features. 
+
+Both scripts build `crash` and run a scripted session against it, printing out a small PASS/FAIL summary based on the expected output.
+
+`test_crash.sh` starts two background `sleep` jobs, runs `nuke %1` and checks that both jobs reached the `running sleep` state and that at least one `killed sleep` appeared in the output.
+
+`test_crash_fg_bg.sh` tests the suspend and resume behavior for foreground and background jobs. It suspends a foreground `sleep` with `SIGTSTP` (equivalent to pressing Ctrl+Z when we're using
+`crash`), suspends a background `sleep` and resumes it with `bg <PID>`, and checks for the `suspended`, `continued` and `killed` messages for each PID.
+
+To run them:
+
+```
+chmod +x test_crash.sh test_crash_fg_bg.sh
+
+./test_crash.sh
+./test_crash_fg_bg.sh
+```
+
+More thorough testing can (and should when making changes) be done by actually putting the inputs in directly as shown below.
+
 
 ### Example Inputs
+
+Once you get `crash` running (see above), here are some simple tests you can do to verify the appropriate output. Your order of interruption (i.e. when you
+get the `finished sleep` message) may vary depending on your typing speed, but other than that putting the instructions in in the same order should yield the
+same results.
 
 #### General Usage
 
@@ -52,7 +78,6 @@ nuke %3
 crash> jobs
 crash> quit
 ```
-
 
 
 #### Bad Inputs
