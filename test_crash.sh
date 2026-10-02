@@ -13,6 +13,10 @@ echo "[BUILD] Compiling crash..."
 make crash >/dev/null
 
 echo "[RUN] Scenario: two background jobs + nuke %1"
+
+# turn -e off while crash runs, so a non-zero exit is reported below
+# instead of silently ending the script
+set +e
 {
     # start two background sleep jobs
     echo "sleep 5 &"
@@ -34,6 +38,7 @@ echo "[RUN] Scenario: two background jobs + nuke %1"
     echo "quit"
 } | "$BIN" > test_out.txt 2> test_err.txt
 CRASH_STATUS=$?
+set -e
 
 echo
 echo "==== crash stdout ===="
