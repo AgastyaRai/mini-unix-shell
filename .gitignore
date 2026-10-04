@@ -1,0 +1,8 @@
+# build output
+crash
+*.so
+
+# files written by the test scripts
+test_*out.txt
+test_*err.txt
+crash_in

@@ -16,22 +16,31 @@ It runs external programs with `fork`/`execvp`, background jobs with `&`, and ha
 
 ### Shell Scripts
 
-This repo also contains simple shell scripts that test and demonstrate the job control features. 
+This repo also contains simple test scripts that test and demonstrate the job control features. 
 
-Both scripts build `crash` and run a scripted session against it, printing out a small PASS/FAIL summary based on the expected output.
+Each script builds `crash` and runs a scripted session against it, printing out a small PASS/FAIL summary based on the expected output.
 
 `test_crash.sh` starts two background `sleep` jobs, runs `nuke %1` and checks that both jobs reached the `running sleep` state and that at least one `killed sleep` appeared in the output.
 
 `test_crash_fg_bg.sh` tests the suspend and resume behavior for foreground and background jobs. It suspends a foreground `sleep` with `SIGTSTP` (equivalent to pressing Ctrl+Z when we're using
 `crash`), suspends a background `sleep` and resumes it with `bg <PID>`, and checks for the `suspended`, `continued` and `killed` messages for each PID.
 
+`test_crash_regressions.sh` covers bugs found in a code review: running more than 32 commands in one session, the output format for a non-zero exit status, a line with more than 1024 words, and `nuke` reaching processes that a job started itself.
+
+The scripts above feed `crash` through a pipe or FIFO, so there's no terminal involved. `test_crash_pty.py` (Python 3, standard library only) runs `crash` inside a pseudo-terminal instead and types Ctrl+Z, Ctrl+C and Ctrl+D itself, which tests handing the terminal to a job with `tcsetpgrp` and taking it back.
+
+`test_crash_race.py` covers two timing bugs in `fg` that only show up in a gap of a few microseconds, so the other tests pass even on the old code. It preloads `delay_sigcont.so` (built from `delay_sigcont.c`) with `LD_PRELOAD`, which replaces `kill()` with a version that waits 200 ms after sending `SIGCONT`. `crash` itself is unchanged, but the gaps get wide enough that the old code fails every time: a job that reads the terminal right after `fg` gets stopped again, and a job that ends as soon as it's continued leaves `fg` waiting forever.
+
 To run them:
 
 ```
-chmod +x test_crash.sh test_crash_fg_bg.sh
+chmod +x test_crash.sh test_crash_fg_bg.sh test_crash_regressions.sh
 
 ./test_crash.sh
 ./test_crash_fg_bg.sh
+./test_crash_regressions.sh
+python3 test_crash_pty.py
+python3 test_crash_race.py
 ```
 
 More thorough testing can (and should when making changes) be done by actually putting the inputs in directly as shown below.

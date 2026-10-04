@@ -5,6 +5,7 @@
 #include <string.h>
 #include <assert.h>
 #include <signal.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
@@ -12,7 +13,7 @@
 
 // global variables
 int processCount = 0;
-pid_t foregroundPID = -1;
+volatile sig_atomic_t foregroundPID = -1; // volatile sig_atomic_t since the signal handlers read it
 
 // structs
 struct job {
@@ -33,6 +34,10 @@ struct job jobs[32];
 static void signalMessage(int jobNumber, pid_t pid, char *commandName, int exitStatus, int value);
 static int intToStringLength(int number, char *buffer, int bufferLength);
 static int findJobIndexByJobNumber(int jobNumber);
+static int findFreeSlot();
+static void signalJob(pid_t pid, int signalNumber);
+static void runInForeground(int jobIndex);
+static void writeError(char *errorMessage, int errorMessageLength);
 
 
 void eval(const char **toks, bool bg) { // bg is true iff command ended with &
@@ -99,7 +104,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             // kill all the jobs
             for (int i = 0; i < 32; i++) {
                 if (jobs[i].running || jobs[i].stopped) {
-                    kill(jobs[i].pid, SIGKILL);
+                    signalJob(jobs[i].pid, SIGKILL);
                 }
             }
 
@@ -130,7 +135,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 if (!validInteger || jobNumber < 1) {
                     char errorMessage[MAXLINE];
                     int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: bad argument for nuke: %s\n", toks[i]);
-                    write(STDERR_FILENO, errorMessage, errorMessageLength);
+                    writeError(errorMessage, errorMessageLength);
                     fflush(stdout);
                     continue;
                 }
@@ -146,14 +151,14 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 if (jobIndex == -1) {
                     char errorMessage[MAXLINE];
                     int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: no job %d\n", jobNumber);
-                    write(STDERR_FILENO, errorMessage, errorMessageLength);
+                    writeError(errorMessage, errorMessageLength);
                     fflush(stdout);
                     sigprocmask(SIG_UNBLOCK, &mask, NULL);
                     continue;
                 }
 
                 // kill the job
-                kill(jobs[jobIndex].pid, SIGKILL);
+                signalJob(jobs[jobIndex].pid, SIGKILL);
 
                 // unmask the signals
                 sigprocmask(SIG_UNBLOCK, &mask, NULL);
@@ -180,7 +185,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             if (!validInteger || pid < 0) {
                 char errorMessage[MAXLINE];
                 int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: bad argument for nuke: %s\n", toks[i]);
-                write(STDERR_FILENO, errorMessage, errorMessageLength);
+                writeError(errorMessage, errorMessageLength);
                 fflush(stdout);
                 continue;
             }
@@ -191,7 +196,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             for (int j = 0; j < 32; j++) {
                 if ((jobs[j].running || jobs[j].stopped) && jobs[j].pid == pid) {
                     matchFound = true;
-                    kill(jobs[j].pid, SIGKILL);
+                    signalJob(jobs[j].pid, SIGKILL);
                     fflush(stdout);
                     break;
                 }
@@ -200,7 +205,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             if (!matchFound) {
                 char errorMessage[MAXLINE];
                 int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: no PID %d\n", pid);
-                write(STDERR_FILENO, errorMessage, errorMessageLength);
+                writeError(errorMessage, errorMessageLength);
                 fflush(stdout);    
             }
 
@@ -216,13 +221,13 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
         if (toks[1] == NULL) {
             char errorMessage[MAXLINE];
             int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: fg needs exactly one argument\n");
-            write(STDERR_FILENO, errorMessage, errorMessageLength);
+            writeError(errorMessage, errorMessageLength);
             fflush(stdout);
             return;
         } else if (toks[2] != NULL) {
             char errorMessage[MAXLINE];
             int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: fg needs exactly one argument\n");
-            write(STDERR_FILENO, errorMessage, errorMessageLength);
+            writeError(errorMessage, errorMessageLength);
             fflush(stdout);
             return;
         }
@@ -246,7 +251,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             if (!validInteger || jobNumber < 1) {
                 char errorMessage[MAXLINE];
                 int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: bad argument for fg: %s\n", toks[1]);
-                write(STDERR_FILENO, errorMessage, errorMessageLength);
+                writeError(errorMessage, errorMessageLength);
                 fflush(stdout);
                 return;
             }
@@ -256,36 +261,22 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             if (jobIndex == -1) {
                 char errorMessage[MAXLINE];
                 int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: no job %d\n", jobNumber);
-                write(STDERR_FILENO, errorMessage, errorMessageLength);
+                writeError(errorMessage, errorMessageLength);
                 fflush(stdout);
                 return;
             }
 
-            // put the job in the foreground
+            // mask the signals so the job can't change state while we update it
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCHLD);
+            sigprocmask(SIG_BLOCK, &mask, NULL);
 
-            // check if the job was stopped
-            if (jobs[jobIndex].stopped) {
+            // put the job in the foreground and wait for it
+            runInForeground(jobIndex);
 
-                // send a continue signal
-                kill(jobs[jobIndex].pid, SIGCONT);
-
-                // mark the job as running again
-                jobs[jobIndex].stopped = false;
-                jobs[jobIndex].running = true;
-            }
-
-            // set the process group to the job's process group so it can receive signals
-            foregroundPID = jobs[jobIndex].pid;
-            tcsetpgrp(STDIN_FILENO, jobs[jobIndex].pid);
-
-            // wait for the job to finish
-            while (jobs[jobIndex].running) {
-                usleep(1000);
-            }
-
-            // set the process group back to the shells process group
-            tcsetpgrp(STDIN_FILENO, getpgid(0));
-            foregroundPID = -1;
+            // unmask the signals
+            sigprocmask(SIG_UNBLOCK, &mask, NULL);
             return;
         } else {
             // we assume the argument is a PID
@@ -304,7 +295,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             if (!validInteger || pid < 0) {
                 char errorMessage[MAXLINE];
                 int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: bad argument for fg: %s\n", toks[1]);
-                write(STDERR_FILENO, errorMessage, errorMessageLength);
+                writeError(errorMessage, errorMessageLength);
                 fflush(stdout);
                 return;
             }
@@ -323,35 +314,22 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
             if (jobIndex == -1) {
                 char errorMessage[MAXLINE];
                 int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: no PID %d\n", pid);
-                write(STDERR_FILENO, errorMessage, errorMessageLength);
+                writeError(errorMessage, errorMessageLength);
                 fflush(stdout);
                 return;
             }            
 
-            // check if the job was stopped
-            if (jobs[jobIndex].stopped) {
-                // send a continue signal
-                kill(jobs[jobIndex].pid, SIGCONT);
+            // mask the signals so the job can't change state while we update it
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCHLD);
+            sigprocmask(SIG_BLOCK, &mask, NULL);
 
-                // mark the job as running again
-                jobs[jobIndex].stopped = false;
-                jobs[jobIndex].running = true;
-            }
+            // put the job in the foreground and wait for it
+            runInForeground(jobIndex);
 
-            // put the job in the foreground
-
-            // set the process group to the job's process group so it can receive signals
-            foregroundPID = jobs[jobIndex].pid;
-            tcsetpgrp(STDIN_FILENO, jobs[jobIndex].pid);
-
-            // wait for the job to finish
-            while (jobs[jobIndex].running) {
-                usleep(1000);
-            }
-
-            // set the process group back to the shells process group
-            tcsetpgrp(STDIN_FILENO, getpgid(0));
-            foregroundPID = -1;
+            // unmask the signals
+            sigprocmask(SIG_UNBLOCK, &mask, NULL);
             return;
         }
     }
@@ -394,7 +372,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 if (!validInteger || jobNumber < 1 ) {
                     char errorMessage[MAXLINE];
                     int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: bad argument for bg: %s\n", toks[i]);
-                    write(STDERR_FILENO, errorMessage, errorMessageLength);
+                    writeError(errorMessage, errorMessageLength);
                     fflush(stdout);
                     continue;
                 }
@@ -404,7 +382,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 if (jobIndex == -1) {
                     char errorMessage[MAXLINE];
                     int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: no job %d\n", jobNumber);
-                    write(STDERR_FILENO, errorMessage, errorMessageLength);
+                    writeError(errorMessage, errorMessageLength);
                     fflush(stdout);
                     continue;
                 }
@@ -415,7 +393,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 }
 
                 // send a continue signal
-                kill(jobs[jobIndex].pid, SIGCONT);
+                signalJob(jobs[jobIndex].pid, SIGCONT);
 
                 // mark the job as running again
                 jobs[jobIndex].stopped = false;
@@ -438,7 +416,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 if (!validInteger || pid < 0) {
                     char errorMessage[MAXLINE];
                     int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: bad argument for bg: %s\n", toks[i]);
-                    write(STDERR_FILENO, errorMessage, errorMessageLength);
+                    writeError(errorMessage, errorMessageLength);
                     fflush(stdout);
                     continue;
                 }
@@ -457,7 +435,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 if (jobIndex == -1) {
                     char errorMessage[MAXLINE];
                     int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: no PID %d\n", pid);
-                    write(STDERR_FILENO, errorMessage, errorMessageLength);
+                    writeError(errorMessage, errorMessageLength);
                     fflush(stdout);
                     continue;
                 }            
@@ -468,7 +446,7 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
                 }
 
                 // send a continue signal
-                kill(jobs[jobIndex].pid, SIGCONT);
+                signalJob(jobs[jobIndex].pid, SIGCONT);
 
                 // mark the job as running again
                 jobs[jobIndex].stopped = false;
@@ -483,20 +461,23 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
     }
 
 
-    // check the process count
-    if (processCount >= 32) {
-        const char *msg = "ERROR: too many jobs\n";
-        write(STDERR_FILENO, msg, strlen(msg));
-        return;
-    }
-
-    processCount++;
-
     // block any incoming signals using sigprocmask
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
     sigprocmask(SIG_BLOCK, &mask, NULL);
+
+    // check if there's a free slot for the job (the limit is 32 jobs at a time, not 32 in total)
+    int jobIndex = findFreeSlot();
+
+    if (jobIndex == -1) {
+        const char *msg = "ERROR: too many jobs\n";
+        write(STDERR_FILENO, msg, strlen(msg));
+        sigprocmask(SIG_UNBLOCK, &mask, NULL);
+        return;
+    }
+
+    processCount++;
 
     // fork the current process
     pid_t pid = fork();        
@@ -505,12 +486,17 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
         const char *msg = "ERROR: fork didn't work\n";
         write(STDERR_FILENO, msg, strlen(msg));
         processCount--;
+        sigprocmask(SIG_UNBLOCK, &mask, NULL);
         return;
     }
 
 
     if (pid != 0 && bg) {
         // parent process
+
+        // put the child in its own process group (the child does this too, in case it runs first)
+        setpgid(pid, pid);
+
         printf("[%d] (%d)  running  %s\n", processCount, pid, toks[0]);
         fflush(stdout);
 
@@ -522,13 +508,9 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
         newJob.stopped = false;
         newJob.commandName = strdup(toks[0]);
         
-        // add the job to the jobs array
-        for (int i = 0; i < 32; i++) {
-            if (!jobs[i].running && !jobs[i].stopped) {
-                jobs[i] = newJob;
-                break;
-            }
-        }
+        // add the job to the jobs array, freeing the command name from the slot's last job
+        free(jobs[jobIndex].commandName);
+        jobs[jobIndex] = newJob;
 
         // unblock the signals
         sigprocmask(SIG_UNBLOCK, &mask, NULL);
@@ -545,33 +527,18 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
         newJob.stopped = false;
         newJob.commandName = strdup(toks[0]);
         
-        int jobIndex = -1;
-
-        for (int i = 0; i < 32; i++) {
-            if (!jobs[i].running && !jobs[i].stopped) {
-                jobs[i] = newJob;
-                jobIndex = i;
-                break;
-            }
-        }
-
-        // unblock the signals
-        sigprocmask(SIG_UNBLOCK, &mask, NULL);
+        // free the command name from the slot's last job
+        free(jobs[jobIndex].commandName);
+        jobs[jobIndex] = newJob;
 
         // create a new process group for the child process to differentiate between foreground processes for signals
         setpgid(pid, pid);
-        foregroundPID = pid;
-        // transfer control to the child process group
-        tcsetpgrp(STDIN_FILENO, pid);
 
-        // wait for the child process to finish
-        while (jobIndex != -1 && jobs[jobIndex].running) {
-            usleep(1000);
-        }
+        // transfer control to the child process group and wait for it (SIGCHLD is still blocked here)
+        runInForeground(jobIndex);
 
-        // set the process group back to the shells process group
-        tcsetpgrp(STDIN_FILENO, getpgid(0));
-        foregroundPID = -1;
+        // unblock the signals
+        sigprocmask(SIG_UNBLOCK, &mask, NULL);
 
         return;
     }
@@ -579,23 +546,37 @@ void eval(const char **toks, bool bg) { // bg is true iff command ended with &
     // child process
     setpgid(0, 0);
 
+    // a foreground job takes the terminal too, in case it runs before the parent gives it the terminal
+    // (SIGTTOU is still ignored at this point, so this can't stop us)
+    if (!bg) {
+        tcsetpgrp(STDIN_FILENO, getpid());
+    }
+
     // unblock the signals
     sigprocmask(SIG_UNBLOCK, &mask, NULL);
     
-    // reset the signal handlers
+    // reset the signal handlers (including SIGTTOU, since an ignored signal stays ignored after execvp)
     signal(SIGINT, SIG_DFL);
     signal(SIGQUIT, SIG_DFL);
     signal(SIGTSTP, SIG_DFL);
+    signal(SIGTTIN, SIG_DFL);
+    signal(SIGTTOU, SIG_DFL);
 
     // execute the command
-    int checkValue = execvp(toks[0], toks);
+    int checkValue = execvp(toks[0], (char *const *)toks);
 
     if (checkValue == -1) {
+        // save errno before anything else can change it
+        int execError = errno;
+
         // print the error message
         char errorMessage[MAXLINE];
         int errorMessageLength = snprintf(errorMessage, sizeof(errorMessage), "ERROR: cannot run %s\n", toks[0]);
-        write(STDERR_FILENO, errorMessage, errorMessageLength);
-        exit(1);
+        writeError(errorMessage, errorMessageLength);
+
+        // use _exit so we don't flush the stdio buffers we copied from the parent
+        // (127 if the command wasn't found and 126 otherwise, like bash)
+        _exit(execError == ENOENT ? 127 : 126);
     }
 
 }
@@ -608,11 +589,19 @@ void parse_and_eval(char *s) {
     while (*s != '\0') {
         bool end = false;
         bool bg = false;
+        bool tooManyTokens = false;
         int t = 0;
 
         while (*s != '\0' && !end) {
             while (*s == '\n' || *s == '\t' || *s == ' ') ++s;
-            if (*s != ';' && *s != '&' && *s != '\0') toks[t++] = s;
+            if (*s != ';' && *s != '&' && *s != '\0') {
+                // stop adding tokens once toks is full (getline has no length limit, and the last slot is for NULL)
+                if (t < MAXLINE) {
+                    toks[t++] = s;
+                } else {
+                    tooManyTokens = true;
+                }
+            }
             while (strchr("&;\n\t ", *s) == NULL) ++s;
             switch (*s) {
             case '&':
@@ -626,6 +615,14 @@ void parse_and_eval(char *s) {
             if (*s) *s++ = '\0';
         }
         toks[t] = NULL;
+
+        // check if the command had too many tokens
+        if (tooManyTokens) {
+            const char *msg = "ERROR: too many arguments\n";
+            write(STDERR_FILENO, msg, strlen(msg));
+            continue;
+        }
+
         eval(toks, bg);
     }
 }
@@ -654,46 +651,66 @@ int repl() {
 // function to handle sigint signals
 void sigintHandler(int signal) {
     // function to handle sigint signals
+
+    // save errno so the main program doesn't see it change
+    int savedErrno = errno;
+
     if (foregroundPID != -1) {
         kill(-foregroundPID, SIGINT);
     }
+
+    errno = savedErrno;
 }
 
 
 // function to handle sigquit signals
 void sigquitHandler(int signal) {
+    // save errno so the main program doesn't see it change
+    int savedErrno = errno;
+
     if (foregroundPID != -1) {
         kill(-foregroundPID, SIGQUIT);
     } else {
         // no foreground job: exit crash as per spec
-        exit(0);
+        // (_exit since exit isn't safe to call in a signal handler)
+        _exit(0);
     }
+
+    errno = savedErrno;
 }
 
 // function to handle sigtstp signals
 void sigtstpHandler(int signal) {
+    // save errno so the main program doesn't see it change
+    int savedErrno = errno;
+
     if (foregroundPID != -1) {
         kill(-foregroundPID, SIGTSTP);
     }
+
+    errno = savedErrno;
 }
 
 // function to handle sigchild signals
 
 void sigchildHandler(int signal) {
+    // save errno so the main program doesn't see it change
+    int savedErrno = errno;
+
     pid_t pid;
     int status;
 
     while (true) {
 
-        // send a signal to the process
+        // check for any child that finished, stopped or continued
         pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED);
         if (pid <= 0) {
             break;
         }
 
-        // find the job with the same pid
+        // find the job with the same pid (only live jobs, since old slots keep their old pid)
         for (int i = 0; i < 32; i++) {
-            if (jobs[i].pid == pid) {
+            if ((jobs[i].running || jobs[i].stopped) && jobs[i].pid == pid) {
 
                 int jobNumber = jobs[i].jobNumber;
                 char *commandName = jobs[i].commandName;
@@ -737,6 +754,8 @@ void sigchildHandler(int signal) {
             }
         }
     }
+
+    errno = savedErrno;
 }
 
 // function to print the job finished text in a signal safe way
@@ -794,6 +813,8 @@ static void signalMessage(int jobNumber, pid_t pid, char *commandName, int exitS
             for (int i = 0; i < valueLength; i++) {
                 message[messageIndex++] = valueString[i];
             }
+            message[messageIndex++] = ' ';
+            message[messageIndex++] = ' ';
         }
     // signal termination
     } else if (exitStatus == 1) {
@@ -832,8 +853,8 @@ static void signalMessage(int jobNumber, pid_t pid, char *commandName, int exitS
         message[messageIndex++] = ' ';
     }
 
-    // add the command name
-    for (int i = 0; i < strlen(commandName); i++) {
+    // add the command name (stopping before the end of the buffer, leaving room for the newline)
+    for (int i = 0; i < strlen(commandName) && messageIndex < MAXLINE - 2; i++) {
         message[messageIndex++] = commandName[i];
     }
 
@@ -887,6 +908,70 @@ static int findJobIndexByJobNumber(int jobNumber) {
         }
     }
     return -1;
+}
+
+// helper function that returns the index of a free slot in the jobs array, or -1 if they're all taken
+static int findFreeSlot() {
+    for (int i = 0; i < 32; i++) {
+        if (!jobs[i].running && !jobs[i].stopped) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// helper function that sends a signal to a job's whole process group, so any processes it started get it too
+static void signalJob(pid_t pid, int signalNumber) {
+    // fall back to just the process if the process group isn't there
+    if (kill(-pid, signalNumber) == -1) {
+        kill(pid, signalNumber);
+    }
+}
+
+// helper function that puts a job in the foreground and waits for it to finish or stop
+// (it has to be called with SIGCHLD blocked)
+static void runInForeground(int jobIndex) {
+
+    // set the process group to the job's process group so it can receive signals
+    // (before continuing it, so it doesn't get SIGTTIN and stop again if it reads from the terminal right away)
+    foregroundPID = jobs[jobIndex].pid;
+    tcsetpgrp(STDIN_FILENO, jobs[jobIndex].pid);
+
+    // check if the job was stopped
+    if (jobs[jobIndex].stopped) {
+
+        // mark the job as running again
+        jobs[jobIndex].stopped = false;
+        jobs[jobIndex].running = true;
+
+        // send a continue signal
+        signalJob(jobs[jobIndex].pid, SIGCONT);
+    }
+
+    // wait for the job to finish or stop
+    // (sigsuspend unblocks SIGCHLD and waits in one step, so we can't miss the signal)
+    sigset_t emptyMask;
+    sigemptyset(&emptyMask);
+
+    while (jobs[jobIndex].running) {
+        sigsuspend(&emptyMask);
+    }
+
+    // set the process group back to the shells process group
+    tcsetpgrp(STDIN_FILENO, getpgid(0));
+    foregroundPID = -1;
+}
+
+// helper function that writes an error message made with snprintf
+// (snprintf returns the full length even if it had to cut the message off, so we can't write that many bytes)
+static void writeError(char *errorMessage, int errorMessageLength) {
+    if (errorMessageLength > MAXLINE - 1) {
+        // the message got cut off, so write what fits and add the newline back
+        write(STDERR_FILENO, errorMessage, MAXLINE - 1);
+        write(STDERR_FILENO, "\n", 1);
+    } else if (errorMessageLength > 0) {
+        write(STDERR_FILENO, errorMessage, errorMessageLength);
+    }
 }
 
 
